@@ -1,13 +1,9 @@
+// --- Start of <script type="module"> content ---
+
 let scene, camera, renderer, controls, gltfLoader;
 let modelContainer = null, currentModel = null;
 let deviceOrientationControls;
 let isARMode = false, isMotionTrackingActive = false;
-// Nuevo grupo para anclar el modelo en el espacio.
-// Este grupo contendrá el modelo y recibirá la rotación del giroscopio.
-let anchorGroup = new THREE.Group(); 
-// Posición donde el modelo fue colocado y anclado.
-let fixedPosition = new THREE.Vector3(); 
-let modelPlaced = false;
 
 const videoElement = document.getElementById('video-feed');
 
@@ -28,545 +24,524 @@ let placedOnce = false;
 // Estado para pinch scaling
 let pinchState = { active: false, lastDist: 0 };
 
+// Offset para rotación manual + sensores
+let yawOffset = 0;
+let pitchOffset = 0;
+let rollOffset = 0;
+
 // Overlay permisos sensores iOS
 const permissionOverlay = document.getElementById('request-permission-overlay');
 const permissionButton = document.getElementById('request-permission-btn');
 
 permissionButton.addEventListener('click', async () => {
-    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
-        const permissionState = await DeviceOrientationEvent.requestPermission();
-        if (permissionState === 'granted') {
-            permissionOverlay.style.display = 'none';
-            enableMotionTracking(); // Llama a la función si se obtiene el permiso
-        } else {
-            showAlert('Permiso de sensores denegado.');
-        }
-    } else {
-        // Para Android/otros que no requieren solicitud de permiso explícita
+  // Pedir permisos iOS
+  if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
+    try {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if(res === 'granted'){
         permissionOverlay.style.display = 'none';
         enableMotionTracking();
+      } else {
+        alert('Permiso denegado para sensores.');
+      }
+    } catch (e){
+      alert('Error solicitando permisos.');
     }
+  } else {
+    // permiso no requerido (Android o desktop)
+    permissionOverlay.style.display = 'none';
+    enableMotionTracking();
+  }
 });
 
-// Raycaster y plano de referencia para simulación de superficie
-const raycaster = new THREE.Raycaster();
-// Plano invisible para simular el piso (horizontal)
-const plane = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), new THREE.MeshBasicMaterial({ visible: false }));
-plane.rotation.x = -Math.PI / 2; // Rotar para que sea horizontal
-plane.position.y = 0;
+function initThree(){
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+  camera.position.set(0, 0, 0);
+  camera.updateProjectionMatrix();
 
-function initThree() {
-    // 1. Scene Setup
-    scene = new THREE.Scene();
-    scene.add(plane); // Añadir el plano de referencia para raycasting
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x3b4233, 1);
+  document.getElementById('three-container').appendChild(renderer.domElement);
 
-    // 2. Camera Setup
-    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    camera.position.set(0, 1.5, 3); // Posición inicial para modo estándar
+  const ambient = new THREE.AmbientLight(0xffffff, 1.5);
+  scene.add(ambient);
+  const dir = new THREE.DirectionalLight(0xffffff, 1);
+  dir.position.set(5, 5, 5);
+  scene.add(dir);
 
-    // 3. Renderer Setup
-    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setClearColor(0x000000, 0); // Fondo transparente para AR
-    renderer.shadowMap.enabled = true;
-    document.getElementById('canvas-container').appendChild(renderer.domElement);
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.target.set(0, 0, -2);
+  controls.update();
 
-    // 4. Lighting
-    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
-    scene.add(hemiLight);
-    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-    dirLight.position.set(2, 5, 4);
-    dirLight.castShadow = true;
-    scene.add(dirLight);
+  modelContainer = new THREE.Group();
+  scene.add(modelContainer);
 
-    // 5. Controls (OrbitControls for standard mode)
-    controls = new THREE.OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 1.2, 0);
-    controls.update();
+  gltfLoader = new THREE.GLTFLoader();
 
-    // 6. GLTF Loader
-    gltfLoader = new THREE.GLTFLoader();
+  deviceOrientationControls = new THREE.DeviceOrientationControls(camera);
+  deviceOrientationControls.enabled = false;
 
-    // 7. Añadir el grupo de anclaje a la escena
-    scene.add(anchorGroup);
+  window.addEventListener('resize', onWindowResize);
 
-    window.addEventListener('resize', onWindowResize, false);
-    document.addEventListener('touchstart', doubleTapHandler, false);
-
-    // Eventos Touch para escalado por pellizco (pinch-to-scale)
-    renderer.domElement.addEventListener('touchstart', onTouchStart, false);
-    renderer.domElement.addEventListener('touchmove', onTouchMove, false);
-    renderer.domElement.addEventListener('touchend', onTouchEnd, false);
+  renderer.domElement.addEventListener('touchstart', onTouchStart, { passive:false });
+  renderer.domElement.addEventListener('touchmove', onTouchMove, { passive:false });
+  renderer.domElement.addEventListener('touchend', onTouchEnd, { passive:false });
 }
 
-function onWindowResize() {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-}
-
-// =========================================================
-// Modelo
-// =========================================================
-
-function loadModelByName(name) {
-    const url = MODELS[name];
-    if (!url) return;
-
-    if (currentModel) {
-        if (modelContainer) scene.remove(modelContainer);
-        // Quitar el modelo del anchorGroup antes de eliminarlo
-        if (currentModel.parent === anchorGroup) anchorGroup.remove(currentModel);
-        currentModel = null;
-    }
-
-    // Mostrar loader (opcional, pero buena práctica)
-    showAlert('Cargando modelo: ' + name + '...');
-
-    gltfLoader.load(url, (gltf) => {
-        modelContainer = gltf.scene;
-        modelContainer.scale.setScalar(1); // Escala inicial
-        modelContainer.traverse((node) => {
-            if (node.isMesh) {
-                node.castShadow = true;
-                node.receiveShadow = true;
-            }
-        });
-
-        // Crear una sombra de contacto simple (para mejorar el AR)
-        const shadowPlane = new THREE.Mesh(
-            new THREE.PlaneGeometry(1, 1),
-            new THREE.MeshBasicMaterial({
-                color: 0x000000,
-                transparent: true,
-                opacity: 0.5,
-            })
-        );
-        shadowPlane.rotation.x = -Math.PI / 2;
-        shadowPlane.position.y = 0.01;
-        shadowPlane.receiveShadow = true;
-        shadowPlane.name = 'contactShadow';
-        shadowPlane.scale.set(2, 2, 1);
-        modelContainer.add(shadowPlane);
-
-        currentModel = modelContainer;
-        // El modelo se añade inicialmente al anchorGroup
-        anchorGroup.add(currentModel);
-
-        // Resetear posición y rotación del modelo dentro del grupo
-        currentModel.position.set(0, 0, 0);
-        currentModel.rotation.set(0, 0, 0);
-
-        // Por defecto en modo no-AR, colocar cerca del centro
-        if (!isARMode) {
-            currentModel.position.set(0, 0, 0);
-            anchorGroup.position.set(0, 0, 0);
-            modelPlaced = true;
-        } else {
-            // En modo AR, esperar a la colocación
-            modelPlaced = false;
-        }
-
-        showAlert(name + ' cargado. ' + (isARMode ? '¡Doble tap para colocar!' : 'Listo para explorar.'));
-    }, undefined, (error) => {
-        console.error('An error happened during model loading:', error);
-        showAlert('Error al cargar el modelo.');
-    });
-}
-
-function selectModel(name) {
-    loadModelByName(name);
-    toggleModelSelector(false);
-}
-
-function adjustScale(amount) {
-    if (!currentModel) return;
-    const currentScale = currentModel.scale.x;
-    const newScale = Math.max(0.1, currentScale + amount);
-    currentModel.scale.setScalar(newScale);
-
-    // Ajustar la escala de la sombra de contacto
-    const shadow = currentModel.getObjectByName('contactShadow');
-    if (shadow) {
-        shadow.scale.set(newScale * 2, newScale * 2, 1);
-    }
-}
-
-function resetScale() {
-    if (!currentModel) return;
-    currentModel.scale.setScalar(1);
-    const shadow = currentModel.getObjectByName('contactShadow');
-    if (shadow) shadow.scale.set(2, 2, 1);
-    showAlert('Escala reiniciada.');
-}
-
-// =========================================================
-// AR y Controles
-// =========================================================
-
-function toggleARMode(activate) {
-    isARMode = activate;
-
-    // Elementos UI
-    document.getElementById('ar-mode-status').textContent = isARMode ? 'Activo' : 'Inactivo';
-    document.getElementById('placement-controls').classList.toggle('hidden', !isARMode);
-    document.getElementById('ar-toggle-btn').classList.toggle('bg-red-600', isARMode);
-    document.getElementById('ar-toggle-btn').classList.toggle('bg-indigo-600', !isARMode);
-    document.getElementById('ar-toggle-btn').querySelector('span').textContent = isARMode ? 'Desactivar AR' : 'Activar AR';
-
-
-    if (isARMode) {
-        // 1. Mostrar video de la cámara
-        videoElement.style.display = 'block';
-        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-            navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
-                .then(stream => {
-                    videoElement.srcObject = stream;
-                    videoElement.play();
-                })
-                .catch(err => {
-                    console.error("Error al acceder a la cámara:", err);
-                    showAlert('Error: No se pudo acceder a la cámara. Revisa permisos.');
-                    toggleARMode(false); // Volver al modo estándar
-                });
-        }
-
-        // 2. Deshabilitar OrbitControls
-        controls.enabled = false;
-
-        // 3. Inicializar DeviceOrientationControls (sin activarlos aún)
-        if (!deviceOrientationControls) {
-            // Nota: Inicializamos DeviceOrientationControls para que rote la cámara, pero
-            // en el animate, vamos a aplicar esa rotación al anchorGroup.
-            deviceOrientationControls = new THREE.DeviceOrientationControls(camera);
-        }
-
-        // 4. Si el modelo no ha sido colocado, empezar la reubicación
-        if (!modelPlaced) startRelocate();
-        // Si ya ha sido colocado, asegurar que el giroscopio esté activo
-        else if(currentModel && isMotionTrackingActive) enableMotionTracking();
-
+function loadModelByName(name){
+  document.getElementById('current-model').textContent = name;
+  if(currentModel){
+    modelContainer.remove(currentModel);
+    disposeModel(currentModel);
+    currentModel = null;
+  }
+  showAlert(`Cargando ${name}...`);
+  gltfLoader.load(MODELS[name], (gltf) => {
+    currentModel = gltf.scene;
+    const box = new THREE.Box3().setFromObject(currentModel);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    currentModel.position.sub(center);
+    const scaleFactor = 1.5 / Math.max(size.x, size.y, size.z);
+    currentModel.scale.setScalar(scaleFactor);
+    modelContainer.add(currentModel);
+    addContactShadow(currentModel, size.y);
+    showAlert(`${name} cargado.`);
+    if(placedOnce){
+      currentModel.visible = true;
     } else {
-        // Modo Estándar
-        videoElement.pause();
-        videoElement.srcObject = null;
-        videoElement.style.display = 'none';
-        
-        // Esconder UI de AR
-        showPlacementDot(false);
-        disableMotionTracking();
-
-        // Restaurar OrbitControls
-        controls.enabled = true;
-        controls.update();
-        
-        // Resetear la posición del anchorGroup para que el modelo vuelva al centro de la escena.
-        anchorGroup.position.set(0, 0, 0);
-        anchorGroup.rotation.set(0, 0, 0);
-        // La cámara debe estar en su posición de inicio para el modo estándar.
-        camera.position.set(0, 1.5, 3);
-        controls.target.set(0, 1.2, 0);
-        controls.update();
-
-        // El modelo no necesita ser visible si ya estaba escondido (ej. al inicio)
-        if (currentModel) currentModel.visible = true; 
+      currentModel.visible = false;
     }
+  }, undefined, (err) => {
+    console.error('Error cargando GLTF', err);
+    showAlert('Error cargando modelo.');
+  });
 }
 
-function enableMotionTracking() {
-    isMotionTrackingActive = true;
-    if (deviceOrientationControls) {
-        deviceOrientationControls.connect();
-        document.getElementById('motion-status').textContent = 'Activado';
-        showAlert('Sensores de movimiento activados.');
-    } else {
-        // Si se activa Motion Tracking sin haber entrado a AR Mode antes
-        if (!deviceOrientationControls) {
-            deviceOrientationControls = new THREE.DeviceOrientationControls(camera);
-            deviceOrientationControls.connect();
-        }
-        document.getElementById('motion-status').textContent = 'Activado';
-        showAlert('Sensores de movimiento activados.');
+function disposeModel(obj){
+  obj.traverse(o => {
+    if(o.isMesh){
+      if(o.geometry) o.geometry.dispose();
+      if(o.material){
+        if(Array.isArray(o.material)){
+          o.material.forEach(m => m.dispose());
+        } else m.dispose();
+      }
     }
+  });
 }
 
-function disableMotionTracking() {
-    isMotionTrackingActive = false;
-    if (deviceOrientationControls) deviceOrientationControls.disconnect();
-    document.getElementById('motion-status').textContent = 'Desactivado';
-    showAlert('Sensores de movimiento desactivados.');
+function addContactShadow(model, modelHeight){
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(128, 128, 10, 128, 128, 128);
+  g.addColorStop(0, 'rgba(0,0,0,0.6)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 256, 256);
+  const tex = new THREE.CanvasTexture(c);
+  const sprite = new THREE.Sprite(
+    new THREE.SpriteMaterial({ map: tex, transparent:true, depthWrite:false })
+  );
+  sprite.name = 'contactShadow';
+  sprite.position.set(0, -(modelHeight / 2 || 0.5), 0);
+  sprite.scale.set(1.6, 1.6, 1);
+  model.add(sprite);
 }
 
-function toggleMotionTracking() {
-    if (typeof DeviceOrientationEvent.requestPermission === 'function' && !isMotionTrackingActive) {
-        // Mostrar overlay si es iOS y aún no está activo
-        permissionOverlay.style.display = 'flex';
-    } else {
-        if (isMotionTrackingActive) disableMotionTracking();
-        else enableMotionTracking();
-    }
+function onWindowResize(){
+  if(!camera || !renderer) return;
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
 }
 
-function toggleInteractionMode() {
-    if (isARMode) {
-        // En modo AR, si los sensores están activos, NO se pueden rotar el modelo manualmente.
-        showAlert('En modo AR, el control manual de rotación se deshabilita al activar los sensores.');
-        return;
-    }
-    // En modo estándar, habilitar/deshabilitar OrbitControls
-    controls.enabled = !controls.enabled;
-    document.getElementById('lock-status').textContent = controls.enabled ? 'OFF (Rotar)' : 'ON (Fijo)';
+function animate(){
+  requestAnimationFrame(animate);
+  if (controls && controls.enabled) controls.update();
+  if (isMotionTrackingActive && deviceOrientationControls && deviceOrientationControls.enabled){
+    deviceOrientationControls.update();
+    // Aplicar offset para que gestos y sensores se combinen suavemente
+    camera.rotation.y += yawOffset;
+    camera.rotation.x += pitchOffset;
+    camera.rotation.z += rollOffset;
+  }
+  renderer.render(scene, camera);
 }
 
-function showPlacementDot(show) {
-    placementDot.style.display = show ? 'flex' : 'none';
-    placementHint.style.display = show ? 'block' : 'none';
-    reubicBtn.disabled = show; // Deshabilitar reubicación mientras se busca
-    resetScaleBtn.disabled = show; // Deshabilitar escalado mientras se busca
+function showAlert(msg){
+  const box = document.getElementById('custom-alert');
+  document.getElementById('alert-message').textContent = msg;
+  box.classList.remove('opacity-0','pointer-events-none');
+  box.classList.add('opacity-100','pointer-events-auto');
+  clearTimeout(box._t);
+  box._t = setTimeout(() => {
+    box.classList.remove('opacity-100','pointer-events-auto');
+    box.classList.add('opacity-0','pointer-events-none');
+  }, 2200);
 }
 
-function startRelocate() {
-    if (!isARMode) {
-        showAlert('Activa Modo AR para reubicar.');
-        return;
-    }
-    modelPlaced = false; // Permitir que la lógica de updateModelPlacement mueva el modelo
-    showPlacementDot(true);
-    // Posicionar el punto de colocación en el centro (CSS ya lo hace con transform)
-    if (currentModel) currentModel.visible = true;
-    showAlert('Mueve el punto y doble tap para confirmar la nueva posición.');
+// Funciones para toggle modelo, panel, etc. igual que antes...
+function toggleModelSelector(show){
+  const modal = document.getElementById('model-selector-modal');
+  if(show){
+    modal.classList.remove('pointer-events-none','opacity-0');
+    modal.classList.add('opacity-100');
+  } else {
+    modal.classList.remove('opacity-100');
+    modal.classList.add('pointer-events-none','opacity-0');
+  }
+}
+function selectModel(name){
+  toggleModelSelector(false);
+  loadModelByName(name);
 }
 
-// =========================================================
-// Colocación del Modelo (Raycasting y Anclaje)
-// =========================================================
-
-function updateModelPlacement() {
-    if (isARMode && currentModel && !modelPlaced) {
-        // 1. Obtener coordenadas de la pantalla (centro)
-        const x = 0; // Centro horizontal
-        const y = 0; // Centro vertical
-
-        // 2. Proyectar el rayo
-        raycaster.setFromCamera({ x, y }, camera);
-
-        // 3. Intersectar con el plano (simulación de superficie)
-        const intersects = raycaster.intersectObject(plane);
-
-        if (intersects.length > 0) {
-            const intersect = intersects[0];
-            const targetPosition = intersect.point;
-            
-            // Mover el modelo al punto de intersección
-            // IMPORTANTE: Mover el currentModel dentro de anchorGroup 
-            // para que su posición sea relativa al mundo.
-            currentModel.position.copy(targetPosition); 
-            // Compensar la posición del anchorGroup, que es fijo en 0,0,0
-            anchorGroup.position.copy(targetPosition).negate(); 
-
-            // Mostrar el modelo si estaba escondido
-            if (!currentModel.visible) currentModel.visible = true;
-
-            // Actualizar el placementDot para que siga la intersección si es necesario
-            // En este caso, el dot está fijo en el centro de la pantalla, así que no se mueve.
-        } else {
-            // Si no hay intersección, esconder el modelo (ej: apuntando al cielo)
-            currentModel.visible = false;
-        }
-    }
+function toggleControlPanel(){
+  const panel = document.getElementById('control-panel');
+  const menuIcon = document.getElementById('menu-icon');
+  const closeIcon = document.getElementById('close-icon');
+  const visible = panel.classList.toggle('is-visible');
+  if(visible){
+    menuIcon.classList.add('hidden');
+    closeIcon.classList.remove('hidden');
+  } else {
+    menuIcon.classList.remove('hidden');
+    closeIcon.classList.add('hidden');
+  }
 }
 
-function doubleTapHandler(event) {
-    const now = Date.now();
-    const isDoubleTap = now - lastTapTime < 300; // 300ms de umbral
-
-    if (isDoubleTap) {
-        if (isARMode && currentModel && !modelPlaced) {
-            // Confirmación de colocación
-            const x = 0; // Centro horizontal
-            const y = 0; // Centro vertical
-            raycaster.setFromCamera({ x, y }, camera);
-            const intersects = raycaster.intersectObject(plane);
-
-            if (intersects.length > 0) {
-                const intersect = intersects[0];
-                fixedPosition.copy(intersect.point);
-                
-                // 1. Fijar la posición del modelo en el mundo.
-                // El modelo debe estar en fixedPosition. 
-                // Dado que currentModel está en anchorGroup, y anchorGroup está compensando
-                // el movimiento de la cámara, el modelo ya está en la posición correcta 
-                // gracias a la llamada en updateModelPlacement().
-                
-                // 2. Anclar el anchorGroup:
-                // La rotación de la cámara (giroscopio) debe aplicarse INVERSAMENTE al anchorGroup
-                // para que el modelo parezca anclado.
-
-                // Obtener la rotación actual de la cámara
-                const cameraRotation = camera.rotation.clone();
-                
-                // Aplicar la rotación del giroscopio (DeviceOrientationControls) al anchorGroup.
-                // Esto es lo que crea el efecto de anclaje.
-                // El modelo ya está posicionado correctamente por updateModelPlacement,
-                // ahora necesitamos que el 'mundo' rote alrededor del modelo.
-
-                // La posición final del modelo debe ser fixedPosition.
-                currentModel.position.copy(fixedPosition);
-
-                // El anchorGroup no necesita compensar la rotación aquí, 
-                // solo necesitamos que el raycaster no lo mueva más.
-
-                modelPlaced = true;
-                showPlacementDot(false);
-                showAlert('Modelo anclado con éxito. ¡Mueve tu teléfono!');
-            } else {
-                showAlert('No se detecta superficie. Intenta de nuevo.');
-            }
-        }
-    }
-    lastTapTime = now;
-}
-
-
-// Pinch-to-scale handlers
-function getDistance(touches) {
-    const dx = touches[0].pageX - touches[1].pageX;
-    const dy = touches[0].pageY - touches[1].pageY;
-    return Math.sqrt(dx * dx + dy * dy);
-}
-
-function onTouchStart(event) {
-    if (event.touches.length === 2 && currentModel) {
-        pinchState.active = true;
-        pinchState.lastDist = getDistance(event.touches);
-    }
-}
-
-function onTouchMove(event) {
-    if (pinchState.active && event.touches.length === 2) {
-        const currentDist = getDistance(event.touches);
-        const delta = currentDist - pinchState.lastDist;
-
-        // Ajustar el factor de escalado basado en el delta
-        const scaleFactor = delta * 0.005; 
-        
-        adjustScale(scaleFactor);
-        
-        pinchState.lastDist = currentDist;
-    }
-}
-
-function onTouchEnd(event) {
-    if (pinchState.active) {
-        pinchState.active = false;
-    }
-}
-
-// =========================================================
-// Loop Principal
-// =========================================================
-
-function animate() {
-    requestAnimationFrame(animate);
-
-    if (isARMode && isMotionTrackingActive && deviceOrientationControls) {
-        // 1. Actualizar DeviceOrientationControls (lee los sensores)
-        deviceOrientationControls.update();
-
-        // 2. Aplicar la rotación del giroscopio al anchorGroup
-        // Al aplicar la rotación de la cámara al anchorGroup (que contiene el modelo),
-        // y como la cámara misma NO está rotando (deviceOrientationControls.update()
-        // solo calcula la rotación, pero OrbitControls está deshabilitado),
-        // se crea el efecto de que el fondo (el video) y el "mundo" rotan,
-        // dejando el modelo fijo en su posición 3D.
-
-        // Clonar y aplicar la rotación de la cámara (que es calculada por DeviceOrientationControls)
-        // en el eje Y y X (yaw y pitch) al grupo de anclaje.
-        // Hacemos que el anchorGroup rote en la dirección opuesta a la cámara para estabilizar el modelo.
-
-        // NOTA IMPORTANTE: Para Three.js AR sin WebXR, se recomienda rotar el grupo de escena.
-        // DeviceOrientationControls actualiza la rotación de la cámara. Para estabilizar el modelo,
-        // aplicamos la rotación INVERSA al anchorGroup.
-        
-        // Creamos una matriz de rotación del dispositivo.
-        const rotationMatrix = new THREE.Matrix4();
-        rotationMatrix.extractRotation(camera.matrix); // La cámara ya tiene la rotación del giroscopio aplicada en update()
-        
-        // Aplicamos la inversa de esa rotación al anchorGroup.
-        anchorGroup.quaternion.setFromRotationMatrix(rotationMatrix).invert();
-        
-        // Pequeña corrección de posición para simular una colocación más estable, 
-        // ya que el anchorGroup se está moviendo con la rotación del mundo simulado.
-        
-    } else if (!isARMode && controls.enabled) {
-        controls.update();
-    }
-    
-    // Si estamos en modo AR y el modelo no ha sido fijado, actualizar su posición
-    if (isARMode && !modelPlaced) {
-        updateModelPlacement();
-    }
-
-    renderer.render(scene, camera);
-}
-
-// =========================================================
-// Utilidades UI
-// =========================================================
-
-function showAlert(message) {
-    const alertDiv = document.getElementById('app-alert');
-    alertDiv.textContent = message;
-    alertDiv.classList.remove('opacity-0', 'pointer-events-none');
-    alertDiv.classList.add('opacity-100');
-
-    setTimeout(() => {
-        alertDiv.classList.remove('opacity-100');
-        alertDiv.classList.add('opacity-0', 'pointer-events-none');
-    }, 3000);
-}
-
-function toggleModelSelector(show) {
-    const modal = document.getElementById('model-selector-modal');
-    modal.classList.toggle('opacity-0', !show);
-    modal.classList.toggle('pointer-events-none', !show);
-}
-
-function toggleControlPanel(show) {
-    const panel = document.getElementById('control-panel');
-    const menuIcon = document.getElementById('menu-icon');
-    
-    if (show !== undefined) {
-        panel.classList.toggle('is-visible', show);
-        menuIcon.style.display = show ? 'none' : 'block';
-    } else {
-        const isVisible = panel.classList.toggle('is-visible');
-        menuIcon.style.display = isVisible ? 'none' : 'block';
-    }
-}
-
-
-window.onload = function() {
-    initThree();
-    loadModelByName('Duck');
-    animate();
-    document.getElementById('placement-controls').classList.add('hidden');
-    document.getElementById('ar-mode-status').textContent = 'Inactivo';
+function toggleInteractionMode(){
+  if(controls.enabled){
+    controls.enabled = false;
+    document.getElementById('lock-status').textContent = 'ON (Mover)';
+    renderer.domElement.addEventListener('pointerdown', onPointerDownForDrag, false);
+    showAlert('Modo Mover activado.');
+  } else {
+    controls.enabled = true;
     document.getElementById('lock-status').textContent = 'OFF (Rotar)';
-    document.getElementById('control-panel').classList.remove('is-visible');
+    renderer.domElement.removeEventListener('pointerdown', onPointerDownForDrag, false);
+    showAlert('Modo Rotar activado.');
+  }
+}
 
-    // Cargar la vista por defecto de la cámara delantera para el modo AR
-    // Se llama de nuevo en toggleARMode, pero lo hacemos aquí para pre-cargar la lógica
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
-            .then(stream => {
-                videoElement.srcObject = stream;
-            })
-            .catch(err => {
-                console.warn("No se pudo pre-cargar la cámara, se intentará al activar AR.", err);
-            });
+// Detección y arrastre del modelo
+let dragObject = null;
+const pointer = new THREE.Vector2();
+const raycaster = new THREE.Raycaster();
+
+function onPointerDownForDrag(event){
+  pointer.x = (event.clientX / window.innerWidth)*2 - 1;
+  pointer.y = -(event.clientY / window.innerHeight)*2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  if(!currentModel) return;
+  const intersects = raycaster.intersectObjects(currentModel.children, true);
+  if(intersects.length >0){
+    dragObject = modelContainer;
+    renderer.domElement.addEventListener('pointermove', onPointerMoveForDrag, false);
+    renderer.domElement.addEventListener('pointerup', onPointerUpForDrag, false);
+    showAlert('Arrastrando modelo...');
+  }
+}
+function onPointerMoveForDrag(event){
+  if(!dragObject) return;
+  dragObject.position.x += event.movementX * 0.005;
+  dragObject.position.y -= event.movementY * 0.005;
+  if(!isARMode){
+    document.getElementById('ar-x-slider').value = dragObject.position.x;
+    document.getElementById('ar-y-slider').value = dragObject.position.y;
+    document.getElementById('ar-x-value').textContent = dragObject.position.x.toFixed(1);
+    document.getElementById('ar-y-value').textContent = dragObject.position.y.toFixed(1);
+  }
+}
+function onPointerUpForDrag(){
+  dragObject = null;
+  renderer.domElement.removeEventListener('pointermove', onPointerMoveForDrag, false);
+  renderer.domElement.removeEventListener('pointerup', onPointerUpForDrag, false);
+}
+
+// Actualizar posición del modelo desde sliders
+function updateModelPlacement(){
+  if(!modelContainer) return;
+  const x = parseFloat(document.getElementById('ar-x-slider').value);
+  const y = parseFloat(document.getElementById('ar-y-slider').value);
+  const zRot = parseFloat(document.getElementById('ar-z-slider').value) * Math.PI/180;
+  modelContainer.position.set(x, y, -2);
+  modelContainer.rotation.z = zRot;
+  document.getElementById('ar-x-value').textContent = x.toFixed(1);
+  document.getElementById('ar-y-value').textContent = y.toFixed(1);
+  document.getElementById('ar-z-value').textContent = (zRot * 180/Math.PI).toFixed(0);
+}
+
+function adjustScale(delta){
+  if(!currentModel) return;
+  currentModel.scale.x = Math.max(0.1, currentModel.scale.x + delta);
+  currentModel.scale.y = Math.max(0.1, currentModel.scale.y + delta);
+  currentModel.scale.z = Math.max(0.1, currentModel.scale.z + delta);
+  const shadow = currentModel.getObjectByName('contactShadow');
+  if(shadow) shadow.scale.set(currentModel.scale.x*2, currentModel.scale.x*2,1);
+}
+
+// Colocar modelo en pantalla double tap placement dot
+(function setupPlacementDotEvents(){
+  let dragging = false;
+  let startTouchOffset={x:0,y:0};
+
+  placementDot.addEventListener('pointerdown', (e)=>{
+    e.preventDefault();
+    dragging=true;
+    placementDot.setPointerCapture(e.pointerId);
+    startTouchOffset.x = e.clientX - placementDot.getBoundingClientRect().left;
+    startTouchOffset.y = e.clientY - placementDot.getBoundingClientRect().top;
+  });
+  placementDot.addEventListener('pointermove', (e)=>{
+    if(!dragging) return;
+    e.preventDefault();
+    const nx = e.clientX - startTouchOffset.x + placementDot.offsetWidth/2;
+    const ny = e.clientY - startTouchOffset.y + placementDot.offsetHeight/2;
+    placementDot.style.left = `${Math.max(8, Math.min(window.innerWidth-8,nx))}px`;
+    placementDot.style.top = `${Math.max(8, Math.min(window.innerHeight-8,ny))}px`;
+  });
+  placementDot.addEventListener('pointerup', (e)=>{
+    dragging=false;
+    try { placementDot.releasePointerCapture(e.pointerId); } catch(e) {}
+    handleDotTap(e.clientX, e.clientY);
+  });
+
+  placementDot.addEventListener('touchstart', (e)=>{
+    e.preventDefault();
+    if(e.touches.length === 1){
+      const t = e.touches[0];
+      dragging = true;
+      startTouchOffset.x = t.clientX - placementDot.getBoundingClientRect().left;
+      startTouchOffset.y = t.clientY - placementDot.getBoundingClientRect().top;
     }
+  }, {passive:false});
+  placementDot.addEventListener('touchmove', (e)=>{
+    if(!dragging) return;
+    e.preventDefault();
+    const t = e.touches[0];
+    const nx = t.clientX - startTouchOffset.x + placementDot.offsetWidth/2;
+    const ny = t.clientY - startTouchOffset.y + placementDot.offsetHeight/2;
+    placementDot.style.left = `${Math.max(8, Math.min(window.innerWidth-8,nx))}px`;
+    placementDot.style.top = `${Math.max(8, Math.min(window.innerHeight-8,ny))}px`;
+  }, {passive:false});
+  placementDot.addEventListener('touchend', (e)=>{
+    dragging=false;
+    const t = (e.changedTouches && e.changedTouches[0]) || {};
+    const x = t.clientX || (placementDot.getBoundingClientRect().left + placementDot.offsetWidth/2);
+    const y = t.clientY || (placementDot.getBoundingClientRect().top + placementDot.offsetHeight/2);
+    handleDotTap(x, y);
+  }, {passive:false});
+
+  function handleDotTap(clientX, clientY){
+    const now = Date.now();
+    const dt = now - lastTapTime;
+    lastTapTime = now;
+    if(dt < 300){
+      placeModelAtScreen(clientX, clientY);
+    } else {
+      placementDot.style.transform = 'translate(-50%,-50%) scale(0.98)';
+      setTimeout(()=> placementDot.style.transform = 'translate(-50%,-50%) scale(1)', 120);
+    }
+  }
+})();
+
+function screenToWorld(x, y, distance=2.0){
+  const ndcX = (x / window.innerWidth)*2 - 1;
+  const ndcY = -(y / window.innerHeight)*2 + 1;
+  const ndcZ = 0.5;
+  const vec = new THREE.Vector3(ndcX, ndcY, ndcZ).unproject(camera);
+  const dir = vec.sub(camera.position).normalize();
+  return camera.position.clone().add(dir.multiplyScalar(distance));
+}
+
+function placeModelAtScreen(x, y){
+  if(!modelContainer) return;
+  const pos = screenToWorld(x, y, 2.0);
+  modelContainer.position.copy(pos);
+  modelContainer.rotation.set(0, 0, 0);
+  if(currentModel) currentModel.visible = true;
+  placedOnce = true;
+  showPlacementDot(false);
+  reubicBtn.style.display = 'block';
+  resetScaleBtn.style.display = 'block';
+  showAlert('Modelo colocado ✅');
+  document.getElementById('ar-x-slider').value = modelContainer.position.x;
+  document.getElementById('ar-y-slider').value = modelContainer.position.y;
+  document.getElementById('ar-x-value').textContent = modelContainer.position.x.toFixed(1);
+  document.getElementById('ar-y-value').textContent = modelContainer.position.y.toFixed(1);
+}
+
+function showPlacementDot(show){
+  placementDot.style.display = show ? 'flex' : 'none';
+  placementHint.style.display = show ? 'block' : 'none';
+  if(show) placementDot.setAttribute('aria-hidden', 'false');
+  else placementDot.setAttribute('aria-hidden', 'true');
+}
+
+/* Pinch handlers para escala (igual que antes) */
+function onTouchStart(e){
+  if(e.touches && e.touches.length === 2){
+    pinchState.active = true;
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    pinchState.lastDist = Math.hypot(dx, dy);
+  }
+}
+function onTouchMove(e){
+  if(pinchState.active && e.touches && e.touches.length === 2 && currentModel){
+    e.preventDefault();
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    const newDist = Math.hypot(dx, dy);
+    if(pinchState.lastDist > 0){
+      const factor = newDist / pinchState.lastDist;
+      const newScale = Math.max(0.05, Math.min(10, currentModel.scale.x * factor));
+      currentModel.scale.set(newScale,newScale,newScale);
+      const shadow = currentModel.getObjectByName('contactShadow');
+      if(shadow) shadow.scale.set(newScale*2,newScale*2,1);
+    }
+    pinchState.lastDist = newDist;
+  }
+}
+function onTouchEnd(e){
+  if(!e.touches || e.touches.length < 2) pinchState.active = false;
+}
+
+// Control cámara y AR
+async function startCameraPassThrough(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    videoElement.srcObject = stream;
+    videoElement.style.display = 'block';
+    videoElement.play();
+    renderer.setClearColor(0x000000, 0);
+    renderer.domElement.style.zIndex = 10;
+    return true;
+  }catch(err){
+    console.error('Camera error', err);
+    showAlert('No se pudo activar la cámara. Revisa permisos.');
+    return false;
+  }
+}
+function stopCameraPassThrough(){
+  if(videoElement.srcObject){
+    videoElement.srcObject.getTracks().forEach(t => t.stop());
+  }
+  videoElement.srcObject = null;
+  videoElement.style.display = 'none';
+  renderer.setClearColor(0x3b4233, 1);
+  renderer.domElement.style.zIndex = 10;
+}
+
+async function toggleARMode(){
+  isARMode = !isARMode;
+  const statusSpan = document.getElementById('ar-mode-status');
+  const controlsDiv = document.getElementById('placement-controls');
+  const toggleBtn = document.getElementById('toggle-ar-mode-btn');
+
+  if (isARMode) {
+    // Si es iOS, se muestra overlay para pedir permisos
+    if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
+      permissionOverlay.style.display = 'flex';
+    } else {
+      const ok = await startCameraPassThrough();
+      if(!ok){ isARMode = false; return; }
+      statusSpan.textContent = 'Activo';
+      controlsDiv.classList.remove('hidden');
+      toggleBtn.textContent = 'Desactivar Cámara y AR';
+      toggleBtn.classList.remove('bg-red-500'); toggleBtn.classList.add('bg-green-600');
+      controls.enabled = false;
+      document.getElementById('lock-status').textContent = 'ON (Mover)';
+      if (!placedOnce){
+        showPlacementDot(true);
+        placementDot.style.left = '50%'; placementDot.style.top = '50%';
+        placementDot.style.display = 'flex';
+        placementHint.style.display = 'block';
+      } else {
+        showPlacementDot(false);
+        placementHint.style.display = 'none';
+        reubicBtn.style.display = 'block';
+        resetScaleBtn.style.display = 'block';
+      }
+      toggleMotionTracking(true);
+    }
+  } else {
+    stopCameraPassThrough();
+    statusSpan.textContent ='Inactivo';
+    controlsDiv.classList.add('hidden');
+    toggleBtn.textContent = 'Activar Cámara y AR';
+    toggleBtn.classList.remove('bg-green-600'); toggleBtn.classList.add('bg-red-500');
+    controls.enabled = true;
+    document.getElementById('lock-status').textContent = 'OFF (Rotar)';
+    showPlacementDot(false);
+    placementHint.style.display = 'none';
+    toggleMotionTracking(false);
+  }
+}
+
+function enableMotionTracking(){
+  if(!isARMode){
+    showAlert('Activa Modo AR primero.');
+    return;
+  }
+  isMotionTrackingActive = true;
+  deviceOrientationControls.enabled = true;
+  deviceOrientationControls.connect();
+  showAlert('Giroscopio activo.');
+}
+
+function disableMotionTracking(){
+  isMotionTrackingActive = false;
+  deviceOrientationControls.enabled = false;
+  try{ deviceOrientationControls.disconnect();} catch(e){}
+  showAlert('Giroscopio desactivado.');
+}
+
+function toggleMotionTracking(forceState){
+  if(typeof forceState === 'boolean'){
+    if(forceState) enableMotionTracking();
+    else disableMotionTracking();
+  } else {
+    if(isMotionTrackingActive) disableMotionTracking();
+    else enableMotionTracking();
+  }
+}
+
+function startRelocate(){
+  if(!isARMode){
+    showAlert('Activa Modo AR para reubicar.');
+    return;
+  }
+  showPlacementDot(true);
+  placementDot.style.left = `${window.innerWidth/2}px`;
+  placementDot.style.top = `${window.innerHeight/2}px`;
+  if(currentModel) currentModel.visible = true;
+  showAlert('Mueve el punto y doble tap para confirmar la nueva posición.');
+}
+
+function resetScale(){
+  if(!currentModel) return;
+  currentModel.scale.setScalar(1);
+  const shadow = currentModel.getObjectByName('contactShadow');
+  if(shadow) shadow.scale.set(2,2,1);
+  showAlert('Escala reiniciada.');
+}
+
+window.onload = function(){
+  initThree();
+  loadModelByName('Duck');
+  animate();
+  document.getElementById('placement-controls').classList.add('hidden');
+  document.getElementById('ar-mode-status').textContent = 'Inactivo';
+  document.getElementById('lock-status').textContent = 'OFF (Rotar)';
+  document.getElementById('control-panel').classList.remove('is-visible');
 };
 
 window.toggleControlPanel = toggleControlPanel;
@@ -574,8 +549,29 @@ window.toggleARMode = toggleARMode;
 window.toggleMotionTracking = toggleMotionTracking;
 window.toggleInteractionMode = toggleInteractionMode;
 window.adjustScale = adjustScale;
-// Ya no necesitamos updateModelPlacement fuera, se llama en el loop
+window.updateModelPlacement = updateModelPlacement;
 window.selectModel = selectModel;
 window.toggleModelSelector = toggleModelSelector;
 window.startRelocate = startRelocate;
 window.resetScale = resetScale;
+
+// --- End of <script type="module"> content ---
+
+// --- Inline onclicks (external to <script> block, but part of logic) ---
+/*
+<button ... onclick="toggleControlPanel()">
+<button ... onclick="toggleControlPanel()">
+<button ... onclick="toggleModelSelector(true)">
+<button ... onclick="toggleInteractionMode()">
+<button ... onclick="toggleARMode()">
+<button ... onclick="startRelocate()" ...>
+<button ... onclick="resetScale()" ...>
+<button ... onclick="toggleMotionTracking(true)">
+<input ... oninput="updateModelPlacement()" /> (3 times)
+<button ... onclick="adjustScale(-0.1)">
+<button ... onclick="adjustScale(0.1)">
+<button ... onclick="selectModel('Duck')">
+<button ... onclick="selectModel('Helmet')">
+<button ... onclick="selectModel('BoomBox')">
+<button ... onclick="toggleModelSelector(false)">
+*/
