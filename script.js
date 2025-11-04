@@ -25,7 +25,8 @@ let pinchState = { active: false, lastDist: 0 };
 // Variables añadidas para fijar anclaje
 let modelWorldPosition = new THREE.Vector3();
 let cameraQuaternionOnPlacement = new THREE.Quaternion();
-let smoothingFactor = 0.1; // para suavizado de sensores
+let previousCameraQuaternion = new THREE.Quaternion();
+let smoothingFactor = 0.1; // ajuste del suavizado (menor = más suave)
 
 // Overlay permisos sensores iOS
 const permissionOverlay = document.getElementById('request-permission-overlay');
@@ -70,6 +71,7 @@ function initThree(){
 
   controls = new THREE.OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
+  controls.dampingFactor = 0.25;
   controls.target.set(0, 0, -2);
   controls.update();
 
@@ -167,11 +169,13 @@ function animate(){
   if (isMotionTrackingActive && deviceOrientationControls && deviceOrientationControls.enabled){
     deviceOrientationControls.update();
 
-    // Suavizado de la orientación para evitar saltos bruscos
+    // Suavizado de la orientación de cámara para reducir jitter/saltos
     camera.quaternion.slerp(deviceOrientationControls.deviceQuaternion || camera.quaternion, smoothingFactor);
 
-    // Nota: asumimos que la cámara rota pero la posición del modelo no debe cambiar ahora.
-    // No añadimos offsets de yaw/pitch/roll porque la lógica de fijación se basa en quaternion de la cámara en el momento de la colocación.
+    // Guardar el quaternion anterior para posible uso de “clamp”
+    previousCameraQuaternion.copy(camera.quaternion);
+
+    // *** No modificamos la posición del modeloContainer aquí: queda fija la del momento de colocación ***
   }
 
   renderer.render(scene, camera);
@@ -251,14 +255,15 @@ function onPointerDownForDrag(event){
 }
 function onPointerMoveForDrag(event){
   if(!dragObject) return;
+  // En modo AR, evitamos que arrastrar o mover cambie la posición del modelo
+  if(isARMode) return;
+
   dragObject.position.x += event.movementX * 0.005;
   dragObject.position.y -= event.movementY * 0.005;
-  if(!isARMode){
-    document.getElementById('ar-x-slider').value = dragObject.position.x;
-    document.getElementById('ar-y-slider').value = dragObject.position.y;
-    document.getElementById('ar-x-value').textContent = dragObject.position.x.toFixed(1);
-    document.getElementById('ar-y-value').textContent = dragObject.position.y.toFixed(1);
-  }
+  document.getElementById('ar-x-slider').value = dragObject.position.x;
+  document.getElementById('ar-y-slider').value = dragObject.position.y;
+  document.getElementById('ar-x-value').textContent = dragObject.position.x.toFixed(1);
+  document.getElementById('ar-y-value').textContent = dragObject.position.y.toFixed(1);
 }
 function onPointerUpForDrag(){
   dragObject = null;
@@ -276,6 +281,9 @@ function updateModelPlacement(){
   document.getElementById('ar-x-value').textContent = x.toFixed(1);
   document.getElementById('ar-y-value').textContent = y.toFixed(1);
   document.getElementById('ar-z-value').textContent = (zRot * 180/Math.PI).toFixed(0);
+  // Actualizamos también el anclaje si lo deseamos:
+  modelWorldPosition.copy(modelContainer.position);
+  cameraQuaternionOnPlacement.copy(camera.quaternion);
 }
 
 function adjustScale(delta){
@@ -373,21 +381,21 @@ function placeModelAtScreen(x, y){
   resetScaleBtn.style.display = 'block';
   showAlert('Modelo colocado ✅');
 
-  // Guardar anclaje de posición y orientación de la cámara
+  // Guardar anclaje de posición y orientación de la cámara en el momento de colocación
   modelWorldPosition.copy(pos);
   cameraQuaternionOnPlacement.copy(camera.quaternion);
 
-  document.getElementById('ar‑x‑slider').value = modelContainer.position.x;
-  document.getElementById('ar‑y‑slider').value = modelContainer.position.y;
-  document.getElementById('ar‑x‑value').textContent = modelContainer.position.x.toFixed(1);
-  document.getElementById('ar‑y‑value').textContent = modelContainer.position.y.toFixed(1);
+  document.getElementById('ar-x-slider').value = modelContainer.position.x;
+  document.getElementById('ar-y-slider').value = modelContainer.position.y;
+  document.getElementById('ar-x-value').textContent = modelContainer.position.x.toFixed(1);
+  document.getElementById('ar-y-value').textContent = modelContainer.position.y.toFixed(1);
 }
 
 function showPlacementDot(show){
   placementDot.style.display = show ? 'flex' : 'none';
   placementHint.style.display = show ? 'block' : 'none';
-  if(show) placementDot.setAttribute('aria‑hidden', 'false');
-  else placementDot.setAttribute('aria‑hidden', 'true');
+  if(show) placementDot.setAttribute('aria-hidden', 'false');
+  else placementDot.setAttribute('aria-hidden', 'true');
 }
 
 function onTouchStart(e){
@@ -445,9 +453,9 @@ function stopCameraPassThrough(){
 
 async function toggleARMode(){
   isARMode = !isARMode;
-  const statusSpan = document.getElementById('ar‑mode‑status');
-  const controlsDiv = document.getElementById('placement‑controls');
-  const toggleBtn = document.getElementById('toggle‑ar‑mode‑btn');
+  const statusSpan = document.getElementById('ar-mode-status');
+  const controlsDiv = document.getElementById('placement-controls');
+  const toggleBtn = document.getElementById('toggle-ar-mode-btn');
 
   if (isARMode) {
     if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
@@ -458,9 +466,9 @@ async function toggleARMode(){
       statusSpan.textContent = 'Activo';
       controlsDiv.classList.remove('hidden');
       toggleBtn.textContent = 'Desactivar Cámara y AR';
-      toggleBtn.classList.remove('bg‑red‑500'); toggleBtn.classList.add('bg‑green‑600');
+      toggleBtn.classList.remove('bg-red-500'); toggleBtn.classList.add('bg-green-600');
       controls.enabled = false;
-      document.getElementById('lock‑status').textContent = 'ON (Mover)';
+      document.getElementById('lock-status').textContent = 'ON (Mover)';
       if (!placedOnce){
         showPlacementDot(true);
         placementDot.style.left = '50%'; placementDot.style.top = '50%';
@@ -479,9 +487,9 @@ async function toggleARMode(){
     statusSpan.textContent = 'Inactivo';
     controlsDiv.classList.add('hidden');
     toggleBtn.textContent = 'Activar Cámara y AR';
-    toggleBtn.classList.remove('bg‑green‑600'); toggleBtn.classList.add('bg‑red‑500');
+    toggleBtn.classList.remove('bg-green-600'); toggleBtn.classList.add('bg-red-500');
     controls.enabled = true;
-    document.getElementById('lock‑status').textContent = 'OFF (Rotar)';
+    document.getElementById('lock-status').textContent = 'OFF (Rotar)';
     showPlacementDot(false);
     placementHint.style.display = 'none';
     toggleMotionTracking(false);
@@ -496,6 +504,8 @@ function enableMotionTracking(){
   isMotionTrackingActive = true;
   deviceOrientationControls.enabled = true;
   deviceOrientationControls.connect();
+  // inicializamos previous quaternion
+  previousCameraQuaternion.copy(camera.quaternion);
   showAlert('Giroscopio activo.');
 }
 
@@ -540,10 +550,10 @@ window.onload = function(){
   initThree();
   loadModelByName('Duck');
   animate();
-  document.getElementById('placement‑controls').classList.add('hidden');
-  document.getElementById('ar‑mode‑status').textContent = 'Inactivo';
-  document.getElementById('lock‑status').textContent = 'OFF (Rotar)';
-  document.getElementById('control‑panel').classList.remove('is‑visible');
+  document.getElementById('placement-controls').classList.add('hidden');
+  document.getElementById('ar-mode-status').textContent = 'Inactivo';
+  document.getElementById('lock-status').textContent = 'OFF (Rotar)';
+  document.getElementById('control-panel').classList.remove('is-visible');
 };
 
 window.toggleControlPanel = toggleControlPanel;
