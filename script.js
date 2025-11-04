@@ -1,8 +1,6 @@
-// --- INICIO: Código JS corregido y mejorado (anclaje absoluto al colocar) ---
-
 let scene, camera, renderer, controls, gltfLoader;
 let modelContainer = null, currentModel = null;
-let deviceOrientationControls, deviceOrientationObject;
+let deviceOrientationControls;
 let isARMode = false, isMotionTrackingActive = false;
 
 const videoElement = document.getElementById('video-feed');
@@ -20,17 +18,16 @@ const resetScaleBtn = document.getElementById('reset-scale-btn');
 
 let lastTapTime = 0;
 let placedOnce = false;
-let relocating = false; // true while user is reubicando (permitir mover placement dot)
 
-// Pinch state
+// Estado para pinch scaling
 let pinchState = { active: false, lastDist: 0 };
 
-// Offsets for manual rotation (radians). We won't apply these each frame directly to camera.
-let yawOffset = 0;
-let pitchOffset = 0;
-let rollOffset = 0;
+// Variables añadidas para fijar anclaje
+let modelWorldPosition = new THREE.Vector3();
+let cameraQuaternionOnPlacement = new THREE.Quaternion();
+let smoothingFactor = 0.1; // para suavizado de sensores
 
-// Permission overlay
+// Overlay permisos sensores iOS
 const permissionOverlay = document.getElementById('request-permission-overlay');
 const permissionButton = document.getElementById('request-permission-btn');
 
@@ -55,47 +52,37 @@ permissionButton.addEventListener('click', async () => {
 
 function initThree(){
   scene = new THREE.Scene();
-
-  camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 1000);
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
   camera.position.set(0, 0, 0);
   camera.updateProjectionMatrix();
 
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setClearColor(0x3b4233, 1);
   document.getElementById('three-container').appendChild(renderer.domElement);
 
-  // Lighting
   const ambient = new THREE.AmbientLight(0xffffff, 1.5);
   scene.add(ambient);
   const dir = new THREE.DirectionalLight(0xffffff, 1);
   dir.position.set(5, 5, 5);
   scene.add(dir);
 
-  // Orbit controls (for non-AR mode)
   controls = new THREE.OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.target.set(0, 0, -2);
   controls.update();
 
-  // Container for the model (world-space anchor)
   modelContainer = new THREE.Group();
-  // start with matrixAutoUpdate = true; when fixed we will set it false
-  modelContainer.matrixAutoUpdate = true;
   scene.add(modelContainer);
 
   gltfLoader = new THREE.GLTFLoader();
 
-  // Device orientation: we create an intermediate object that DeviceOrientationControls will update.
-  // Then in the render loop we smoothly slerp the camera quaternion towards that object's quaternion.
-  deviceOrientationObject = new THREE.Object3D();
-  deviceOrientationControls = new THREE.DeviceOrientationControls(deviceOrientationObject);
+  deviceOrientationControls = new THREE.DeviceOrientationControls(camera);
   deviceOrientationControls.enabled = false;
 
   window.addEventListener('resize', onWindowResize);
 
-  // Touch handlers on renderer
   renderer.domElement.addEventListener('touchstart', onTouchStart, { passive:false });
   renderer.domElement.addEventListener('touchmove', onTouchMove, { passive:false });
   renderer.domElement.addEventListener('touchend', onTouchEnd, { passive:false });
@@ -111,7 +98,6 @@ function loadModelByName(name){
   showAlert(`Cargando ${name}...`);
   gltfLoader.load(MODELS[name], (gltf) => {
     currentModel = gltf.scene;
-    // Normalize pivot to center
     const box = new THREE.Box3().setFromObject(currentModel);
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
@@ -121,7 +107,11 @@ function loadModelByName(name){
     modelContainer.add(currentModel);
     addContactShadow(currentModel, size.y);
     showAlert(`${name} cargado.`);
-    currentModel.visible = placedOnce ? true : false;
+    if(placedOnce){
+      currentModel.visible = true;
+    } else {
+      currentModel.visible = false;
+    }
   }, undefined, (err) => {
     console.error('Error cargando GLTF', err);
     showAlert('Error cargando modelo.');
@@ -142,14 +132,18 @@ function disposeModel(obj){
 }
 
 function addContactShadow(model, modelHeight){
-  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
   const ctx = c.getContext('2d');
   const g = ctx.createRadialGradient(128, 128, 10, 128, 128, 128);
   g.addColorStop(0, 'rgba(0,0,0,0.6)');
   g.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = g; ctx.fillRect(0, 0, 256, 256);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 256, 256);
   const tex = new THREE.CanvasTexture(c);
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent:true, depthWrite:false }));
+  const sprite = new THREE.Sprite(
+    new THREE.SpriteMaterial({ map: tex, transparent:true, depthWrite:false })
+  );
   sprite.name = 'contactShadow';
   sprite.position.set(0, -(modelHeight / 2 || 0.5), 0);
   sprite.scale.set(1.6, 1.6, 1);
@@ -163,47 +157,21 @@ function onWindowResize(){
   renderer.setSize(window.innerWidth, window.innerHeight);
 }
 
-let lastCameraQuat = new THREE.Quaternion();
-let smoothedCameraQuat = new THREE.Quaternion();
-
-// --- FIXED MATRIX ---
-// Guardamos la matriz absoluta (matrixWorld) del container cuando se coloca, y la usamos cada frame
-let fixedMatrix = new THREE.Matrix4(); // matriz WORLD donde se ancla el objeto
-
-// animate/render loop with quaternion smoothing to stabilize orientation
 function animate(){
   requestAnimationFrame(animate);
 
-  if (controls && controls.enabled) controls.update();
-
-  if (isMotionTrackingActive && deviceOrientationControls && deviceOrientationControls.enabled) {
-    deviceOrientationControls.update();
-
-    // Build offset quaternion from yaw/pitch/roll offsets (if any)
-    const offsetEuler = new THREE.Euler(pitchOffset, yawOffset, rollOffset, 'YXZ');
-    const offsetQuat = new THREE.Quaternion().setFromEuler(offsetEuler);
-
-    const targetQuat = deviceOrientationObject.quaternion.clone().multiply(offsetQuat);
-
-    const angle = smoothedCameraQuat.angleTo(targetQuat);
-
-    let alpha = 0.18;
-    if (angle > 0.5) alpha = 0.45;
-    else if (angle > 0.15) alpha = 0.28;
-
-    smoothedCameraQuat.slerp(targetQuat, alpha);
-    camera.quaternion.copy(smoothedCameraQuat);
-    lastCameraQuat.copy(smoothedCameraQuat);
+  if (controls && controls.enabled){
+    controls.update();
   }
 
-  // If placedOnce and fixedMatrix set -> enforce absolute fixed transform
-  if (placedOnce && modelContainer) {
-    // Force the world transform to the fixed matrix every frame (bloqueo absoluto)
-    modelContainer.matrix.copy(fixedMatrix);
-    // Decompose matrix into position/quaternion/scale for render and child meshes
-    modelContainer.matrix.decompose(modelContainer.position, modelContainer.quaternion, modelContainer.scale);
-    // Ensure Three.js won't override the matrix
-    modelContainer.matrixAutoUpdate = false;
+  if (isMotionTrackingActive && deviceOrientationControls && deviceOrientationControls.enabled){
+    deviceOrientationControls.update();
+
+    // Suavizado de la orientación para evitar saltos bruscos
+    camera.quaternion.slerp(deviceOrientationControls.deviceQuaternion || camera.quaternion, smoothingFactor);
+
+    // Nota: asumimos que la cámara rota pero la posición del modelo no debe cambiar ahora.
+    // No añadimos offsets de yaw/pitch/roll porque la lógica de fijación se basa en quaternion de la cámara en el momento de la colocación.
   }
 
   renderer.render(scene, camera);
@@ -221,7 +189,6 @@ function showAlert(msg){
   }, 2200);
 }
 
-// UI helpers (kept names so HTML inline onclick continues to work)
 function toggleModelSelector(show){
   const modal = document.getElementById('model-selector-modal');
   if(show){
@@ -265,47 +232,27 @@ function toggleInteractionMode(){
   }
 }
 
-// Dragging using pointer events (for manual repositioning)
-// NOTE: when model is fixed (placedOnce && !relocating) dragging is disabled to preserve anchor
 let dragObject = null;
 const pointer = new THREE.Vector2();
 const raycaster = new THREE.Raycaster();
 
 function onPointerDownForDrag(event){
-  event.preventDefault();
-
-  // If model already placed and not in relocating mode, prevent drag
-  if (placedOnce && !relocating) return;
-
   pointer.x = (event.clientX / window.innerWidth)*2 - 1;
   pointer.y = -(event.clientY / window.innerHeight)*2 + 1;
   raycaster.setFromCamera(pointer, camera);
   if(!currentModel) return;
   const intersects = raycaster.intersectObjects(currentModel.children, true);
-  if(intersects.length > 0){
+  if(intersects.length >0){
     dragObject = modelContainer;
     renderer.domElement.addEventListener('pointermove', onPointerMoveForDrag, false);
     renderer.domElement.addEventListener('pointerup', onPointerUpForDrag, false);
     showAlert('Arrastrando modelo...');
-    // If we were fixed, temporarily allow matrixAutoUpdate so drag moves visual object while relocating
-    if (placedOnce && relocating) modelContainer.matrixAutoUpdate = true;
   }
 }
 function onPointerMoveForDrag(event){
   if(!dragObject) return;
   dragObject.position.x += event.movementX * 0.005;
   dragObject.position.y -= event.movementY * 0.005;
-
-  // If user is relocating, update the fixedMatrix preview so when they confirm placement it becomes fixed
-  if (relocating) {
-    // build new matrix from position and current rotation/scale
-    const m = new THREE.Matrix4();
-    const q = dragObject.quaternion.clone();
-    const s = dragObject.scale.clone();
-    m.compose(dragObject.position.clone(), q, s);
-    fixedMatrix.copy(m); // preview in fixedMatrix
-  }
-
   if(!isARMode){
     document.getElementById('ar-x-slider').value = dragObject.position.x;
     document.getElementById('ar-y-slider').value = dragObject.position.y;
@@ -317,35 +264,15 @@ function onPointerUpForDrag(){
   dragObject = null;
   renderer.domElement.removeEventListener('pointermove', onPointerMoveForDrag, false);
   renderer.domElement.removeEventListener('pointerup', onPointerUpForDrag, false);
-  // If user finished relocating with drag, we'll keep fixedMatrix updated but not enforce until double-tap placement confirms.
 }
 
-// Update model from sliders
 function updateModelPlacement(){
   if(!modelContainer) return;
   const x = parseFloat(document.getElementById('ar-x-slider').value);
   const y = parseFloat(document.getElementById('ar-y-slider').value);
   const zRot = parseFloat(document.getElementById('ar-z-slider').value) * Math.PI/180;
-
-  // Instead of directly moving the object while fixed, compute a new fixedMatrix and save it.
-  const pos = new THREE.Vector3(x, y, -2);
-  const quat = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, zRot, 'XYZ'));
-  const scale = modelContainer.scale.clone();
-  const m = new THREE.Matrix4().compose(pos, quat, scale);
-
-  fixedMatrix.copy(m);
-  // If we are not yet placed, allow visual preview by applying matrix to modelContainer
-  if (!placedOnce || relocating) {
-    modelContainer.matrixAutoUpdate = true;
-    modelContainer.position.copy(pos);
-    modelContainer.rotation.set(0,0,zRot);
-  } else {
-    // enforce matrix immediately if already placed
-    modelContainer.matrix.copy(fixedMatrix);
-    modelContainer.matrix.decompose(modelContainer.position, modelContainer.quaternion, modelContainer.scale);
-    modelContainer.matrixAutoUpdate = false;
-  }
-
+  modelContainer.position.set(x, y, -2);
+  modelContainer.rotation.z = zRot;
   document.getElementById('ar-x-value').textContent = x.toFixed(1);
   document.getElementById('ar-y-value').textContent = y.toFixed(1);
   document.getElementById('ar-z-value').textContent = (zRot * 180/Math.PI).toFixed(0);
@@ -356,25 +283,11 @@ function adjustScale(delta){
   currentModel.scale.x = Math.max(0.1, currentModel.scale.x + delta);
   currentModel.scale.y = Math.max(0.1, currentModel.scale.y + delta);
   currentModel.scale.z = Math.max(0.1, currentModel.scale.z + delta);
-
-  // update fixedMatrix scale if placed
-  if (placedOnce) {
-    // decompose fixedMatrix, replace scale
-    const pos = new THREE.Vector3();
-    const q = new THREE.Quaternion();
-    const s = new THREE.Vector3();
-    fixedMatrix.decompose(pos, q, s);
-    const newM = new THREE.Matrix4().compose(pos, q, currentModel.scale.clone());
-    fixedMatrix.copy(newM);
-    modelContainer.matrix.copy(fixedMatrix);
-    modelContainer.matrix.decompose(modelContainer.position, modelContainer.quaternion, modelContainer.scale);
-  }
-
   const shadow = currentModel.getObjectByName('contactShadow');
   if(shadow) shadow.scale.set(currentModel.scale.x*2, currentModel.scale.x*2,1);
 }
 
-// --- Placement dot handlers (double-tap to place) ---
+// Colocar modelo en pantalla doble tap placement dot
 (function setupPlacementDotEvents(){
   let dragging = false;
   let startTouchOffset={x:0,y:0};
@@ -431,7 +344,6 @@ function adjustScale(delta){
     const dt = now - lastTapTime;
     lastTapTime = now;
     if(dt < 300){
-      // Confirm placement: if relocating then finalize anchor; if not yet placed, place first time.
       placeModelAtScreen(clientX, clientY);
     } else {
       placementDot.style.transform = 'translate(-50%,-50%) scale(0.98)';
@@ -440,8 +352,6 @@ function adjustScale(delta){
   }
 })();
 
-// Convert screen coords to world point at a given distance from camera.
-// distance is measured in world units (meters in your virtual scene)
 function screenToWorld(x, y, distance=2.0){
   const ndcX = (x / window.innerWidth)*2 - 1;
   const ndcY = -(y / window.innerHeight)*2 + 1;
@@ -453,51 +363,33 @@ function screenToWorld(x, y, distance=2.0){
 
 function placeModelAtScreen(x, y){
   if(!modelContainer) return;
-
-  // If relocating (reubic) allow placing at new point; otherwise first placement
   const pos = screenToWorld(x, y, 2.0);
-
-  // Compose matrix: position, keep current rotation around Z only (or reset)
-  const zRot = parseFloat(document.getElementById('ar-z-slider').value) * Math.PI/180 || 0;
-  const quat = new THREE.Quaternion().setFromEuler(new THREE.Euler(0,0,zRot, 'XYZ'));
-  const scale = currentModel ? currentModel.scale.clone() : new THREE.Vector3(1,1,1);
-
-  const m = new THREE.Matrix4().compose(pos, quat, scale);
-
-  // Save fixedMatrix and enforce lock
-  fixedMatrix.copy(m);
-  modelContainer.matrix.copy(fixedMatrix);
-  modelContainer.matrix.decompose(modelContainer.position, modelContainer.quaternion, modelContainer.scale);
-  modelContainer.matrixAutoUpdate = false;
-
+  modelContainer.position.copy(pos);
+  modelContainer.rotation.set(0, 0, 0);
+  if(currentModel) currentModel.visible = true;
   placedOnce = true;
-  relocating = false;
-
-  // UI updates
-  if (currentModel) currentModel.visible = true;
   showPlacementDot(false);
   reubicBtn.style.display = 'block';
   resetScaleBtn.style.display = 'block';
-  showAlert('Modelo colocado y fijado ✅');
+  showAlert('Modelo colocado ✅');
 
-  document.getElementById('ar-x-slider').value = modelContainer.position.x;
-  document.getElementById('ar-y-slider').value = modelContainer.position.y;
-  document.getElementById('ar-x-value').textContent = modelContainer.position.x.toFixed(1);
-  document.getElementById('ar-y-value').textContent = modelContainer.position.y.toFixed(1);
+  // Guardar anclaje de posición y orientación de la cámara
+  modelWorldPosition.copy(pos);
+  cameraQuaternionOnPlacement.copy(camera.quaternion);
 
-  // Initialize camera smoothing baseline
-  smoothedCameraQuat.copy(camera.quaternion);
-  lastCameraQuat.copy(camera.quaternion);
+  document.getElementById('ar‑x‑slider').value = modelContainer.position.x;
+  document.getElementById('ar‑y‑slider').value = modelContainer.position.y;
+  document.getElementById('ar‑x‑value').textContent = modelContainer.position.x.toFixed(1);
+  document.getElementById('ar‑y‑value').textContent = modelContainer.position.y.toFixed(1);
 }
 
 function showPlacementDot(show){
   placementDot.style.display = show ? 'flex' : 'none';
   placementHint.style.display = show ? 'block' : 'none';
-  if(show) placementDot.setAttribute('aria-hidden', 'false');
-  else placementDot.setAttribute('aria-hidden', 'true');
+  if(show) placementDot.setAttribute('aria‑hidden', 'false');
+  else placementDot.setAttribute('aria‑hidden', 'true');
 }
 
-/* Pinch handlers para escala */
 function onTouchStart(e){
   if(e.touches && e.touches.length === 2){
     pinchState.active = true;
@@ -518,18 +410,6 @@ function onTouchMove(e){
       currentModel.scale.set(newScale,newScale,newScale);
       const shadow = currentModel.getObjectByName('contactShadow');
       if(shadow) shadow.scale.set(newScale*2,newScale*2,1);
-
-      // if placed, update fixedMatrix scale immediately so the anchored object reflects new scale
-      if (placedOnce) {
-        const pos = new THREE.Vector3();
-        const q = new THREE.Quaternion();
-        const s = new THREE.Vector3();
-        fixedMatrix.decompose(pos, q, s);
-        const newM = new THREE.Matrix4().compose(pos, q, currentModel.scale.clone());
-        fixedMatrix.copy(newM);
-        modelContainer.matrix.copy(fixedMatrix);
-        modelContainer.matrix.decompose(modelContainer.position, modelContainer.quaternion, modelContainer.scale);
-      }
     }
     pinchState.lastDist = newDist;
   }
@@ -538,7 +418,6 @@ function onTouchEnd(e){
   if(!e.touches || e.touches.length < 2) pinchState.active = false;
 }
 
-// Camera passthrough
 async function startCameraPassThrough(){
   try{
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
@@ -564,15 +443,14 @@ function stopCameraPassThrough(){
   renderer.domElement.style.zIndex = 10;
 }
 
-// Toggle AR mode (camera + sensors)
 async function toggleARMode(){
   isARMode = !isARMode;
-  const statusSpan = document.getElementById('ar-mode-status');
-  const controlsDiv = document.getElementById('placement-controls');
-  const toggleBtn = document.getElementById('toggle-ar-mode-btn');
+  const statusSpan = document.getElementById('ar‑mode‑status');
+  const controlsDiv = document.getElementById('placement‑controls');
+  const toggleBtn = document.getElementById('toggle‑ar‑mode‑btn');
 
   if (isARMode) {
-    if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
       permissionOverlay.style.display = 'flex';
     } else {
       const ok = await startCameraPassThrough();
@@ -580,9 +458,9 @@ async function toggleARMode(){
       statusSpan.textContent = 'Activo';
       controlsDiv.classList.remove('hidden');
       toggleBtn.textContent = 'Desactivar Cámara y AR';
-      toggleBtn.classList.remove('bg-red-500'); toggleBtn.classList.add('bg-green-600');
+      toggleBtn.classList.remove('bg‑red‑500'); toggleBtn.classList.add('bg‑green‑600');
       controls.enabled = false;
-      document.getElementById('lock-status').textContent = 'ON (Mover)';
+      document.getElementById('lock‑status').textContent = 'ON (Mover)';
       if (!placedOnce){
         showPlacementDot(true);
         placementDot.style.left = '50%'; placementDot.style.top = '50%';
@@ -598,12 +476,12 @@ async function toggleARMode(){
     }
   } else {
     stopCameraPassThrough();
-    statusSpan.textContent ='Inactivo';
+    statusSpan.textContent = 'Inactivo';
     controlsDiv.classList.add('hidden');
     toggleBtn.textContent = 'Activar Cámara y AR';
-    toggleBtn.classList.remove('bg-green-600'); toggleBtn.classList.add('bg-red-500');
+    toggleBtn.classList.remove('bg‑green‑600'); toggleBtn.classList.add('bg‑red‑500');
     controls.enabled = true;
-    document.getElementById('lock-status').textContent = 'OFF (Rotar)';
+    document.getElementById('lock‑status').textContent = 'OFF (Rotar)';
     showPlacementDot(false);
     placementHint.style.display = 'none';
     toggleMotionTracking(false);
@@ -617,16 +495,14 @@ function enableMotionTracking(){
   }
   isMotionTrackingActive = true;
   deviceOrientationControls.enabled = true;
-  try { deviceOrientationControls.connect(); } catch(e){ /* ignore */ }
-  smoothedCameraQuat.copy(camera.quaternion);
-  lastCameraQuat.copy(camera.quaternion);
+  deviceOrientationControls.connect();
   showAlert('Giroscopio activo.');
 }
 
 function disableMotionTracking(){
   isMotionTrackingActive = false;
   deviceOrientationControls.enabled = false;
-  try{ deviceOrientationControls.disconnect(); } catch(e){/* ignore */ }
+  try{ deviceOrientationControls.disconnect(); } catch(e){}
   showAlert('Giroscopio desactivado.');
 }
 
@@ -640,15 +516,11 @@ function toggleMotionTracking(forceState){
   }
 }
 
-// Reubicar: show placement dot again and allow repositioning
 function startRelocate(){
   if(!isARMode){
     showAlert('Activa Modo AR para reubicar.');
     return;
   }
-  relocating = true;
-  // allow visual updates while relocating
-  modelContainer.matrixAutoUpdate = true;
   showPlacementDot(true);
   placementDot.style.left = `${window.innerWidth/2}px`;
   placementDot.style.top = `${window.innerHeight/2}px`;
@@ -656,29 +528,24 @@ function startRelocate(){
   showAlert('Mueve el punto y doble tap para confirmar la nueva posición.');
 }
 
-// Reset scale
 function resetScale(){
   if(!currentModel) return;
   currentModel.scale.setScalar(1);
   const shadow = currentModel.getObjectByName('contactShadow');
   if(shadow) shadow.scale.set(2,2,1);
-
-  // update fixedMatrix scale if placed
-  if (placedOnce) {
-    const pos = new THREE.Vector3();
-    const q = new THREE.Quaternion();
-    const s = new THREE.Vector3();
-    fixedMatrix.decompose(pos, q, s);
-    const newM = new THREE.Matrix4().compose(pos, q, currentModel.scale.clone());
-    fixedMatrix.copy(newM);
-    modelContainer.matrix.copy(fixedMatrix);
-    modelContainer.matrix.decompose(modelContainer.position, modelContainer.quaternion, modelContainer.scale);
-  }
-
   showAlert('Escala reiniciada.');
 }
 
-// Expose functions used by HTML
+window.onload = function(){
+  initThree();
+  loadModelByName('Duck');
+  animate();
+  document.getElementById('placement‑controls').classList.add('hidden');
+  document.getElementById('ar‑mode‑status').textContent = 'Inactivo';
+  document.getElementById('lock‑status').textContent = 'OFF (Rotar)';
+  document.getElementById('control‑panel').classList.remove('is‑visible');
+};
+
 window.toggleControlPanel = toggleControlPanel;
 window.toggleARMode = toggleARMode;
 window.toggleMotionTracking = toggleMotionTracking;
@@ -689,16 +556,3 @@ window.selectModel = selectModel;
 window.toggleModelSelector = toggleModelSelector;
 window.startRelocate = startRelocate;
 window.resetScale = resetScale;
-
-// init on load
-window.onload = function(){
-  initThree();
-  loadModelByName('Duck');
-  animate();
-  document.getElementById('placement-controls').classList.add('hidden');
-  document.getElementById('ar-mode-status').textContent = 'Inactivo';
-  document.getElementById('lock-status').textContent = 'OFF (Rotar)';
-  document.getElementById('control-panel').classList.remove('is-visible');
-};
-
-// --- FIN: Código JS corregido ---
