@@ -18,7 +18,12 @@ const resetScaleBtn = document.getElementById('reset-scale-btn');
 
 let lastTapTime = 0;
 let placedOnce = false;
-let worldAnchor = new THREE.Object3D(); // NUEVO: Ancla para mantener modelo fijo
+let worldAnchor = new THREE.Object3D(); // Ancla para mantener modelo fijo
+
+// Suavizado para mantener posición estable
+const smoothFactor = 0.2;
+let targetPosition = new THREE.Vector3();
+let targetQuaternion = new THREE.Quaternion();
 
 // Estado para pinch scaling
 let pinchState = { active: false, lastDist: 0 };
@@ -82,6 +87,8 @@ function initThree(){
   renderer.domElement.addEventListener('touchstart', onTouchStart, { passive:false });
   renderer.domElement.addEventListener('touchmove', onTouchMove, { passive:false });
   renderer.domElement.addEventListener('touchend', onTouchEnd, { passive:false });
+
+  animate();
 }
 
 function loadModelByName(name){
@@ -103,11 +110,7 @@ function loadModelByName(name){
     modelContainer.add(currentModel);
     addContactShadow(currentModel, size.y);
     showAlert(`${name} cargado.`);
-    if(placedOnce){
-      currentModel.visible = true;
-    } else {
-      currentModel.visible = false;
-    }
+    currentModel.visible = placedOnce; // solo visible si ya colocado
   }, undefined, (err) => {
     console.error('Error cargando GLTF', err);
     showAlert('Error cargando modelo.');
@@ -120,10 +123,17 @@ function animate(){
   if (isMotionTrackingActive && deviceOrientationControls && deviceOrientationControls.enabled){
     deviceOrientationControls.update();
   }
+
+  // Suavizado de posición y rotación para que el modelo se mantenga fijo
+  if(placedOnce){
+    worldAnchor.position.lerp(targetPosition, smoothFactor);
+    worldAnchor.quaternion.slerp(targetQuaternion, smoothFactor);
+  }
+
   renderer.render(scene, camera);
 }
 
-// NUEVO: función para convertir coords de pantalla a posición AR relativa a worldAnchor
+// Convertir coords de pantalla a posición AR relativa a worldAnchor
 function screenToWorldAR(x, y, distance = 2.0){
   const ndcX = (x / window.innerWidth)*2 - 1;
   const ndcY = -(y / window.innerHeight)*2 + 1;
@@ -134,12 +144,15 @@ function screenToWorldAR(x, y, distance = 2.0){
   return worldPos;
 }
 
-// NUEVO: Colocar modelo usando worldAnchor para fijarlo en AR
+// Colocar modelo usando worldAnchor y fijar posición
 function placeModelAtScreen(x, y){
   if(!modelContainer) return;
   const pos = screenToWorldAR(x, y, 2.0);
-  worldAnchor.position.copy(pos); // mover el ancla, no la cámara ni la escena
-  worldAnchor.rotation.set(0, 0, 0);
+
+  // Actualizar target para suavizado
+  targetPosition.copy(pos);
+  targetQuaternion.copy(new THREE.Quaternion()); // rotación inicial
+
   if(currentModel) currentModel.visible = true;
   placedOnce = true;
   showPlacementDot(false);
@@ -147,21 +160,28 @@ function placeModelAtScreen(x, y){
   resetScaleBtn.style.display = 'block';
   showAlert('Modelo colocado ✅');
 
-  // Actualizar sliders
-  document.getElementById('ar-x-slider').value = worldAnchor.position.x;
-  document.getElementById('ar-y-slider').value = worldAnchor.position.y;
-  document.getElementById('ar-x-value').textContent = worldAnchor.position.x.toFixed(1);
-  document.getElementById('ar-y-value').textContent = worldAnchor.position.y.toFixed(1);
+  // Actualizar sliders si los tienes
+  document.getElementById('ar-x-slider').value = targetPosition.x;
+  document.getElementById('ar-y-slider').value = targetPosition.y;
+  document.getElementById('ar-x-value').textContent = targetPosition.x.toFixed(1);
+  document.getElementById('ar-y-value').textContent = targetPosition.y.toFixed(1);
 }
 
+// Actualizar placement desde sliders
 function updateModelPlacement(){
   if(!worldAnchor) return;
   const x = parseFloat(document.getElementById('ar-x-slider').value);
   const y = parseFloat(document.getElementById('ar-y-slider').value);
   const zRot = parseFloat(document.getElementById('ar-z-slider').value) * Math.PI/180;
-  worldAnchor.position.set(x, y, -2);
-  worldAnchor.rotation.z = zRot;
+  targetPosition.set(x, y, -2);
+  targetQuaternion.setFromEuler(new THREE.Euler(0, 0, zRot));
   document.getElementById('ar-x-value').textContent = x.toFixed(1);
   document.getElementById('ar-y-value').textContent = y.toFixed(1);
   document.getElementById('ar-z-value').textContent = (zRot * 180/Math.PI).toFixed(0);
+}
+
+function onWindowResize(){
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
 }
