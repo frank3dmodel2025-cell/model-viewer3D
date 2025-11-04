@@ -1,3 +1,5 @@
+// --- Start of <script type="module"> content ---
+
 let scene, camera, renderer, controls, gltfLoader;
 let modelContainer = null, currentModel = null;
 let deviceOrientationControls;
@@ -552,3 +554,24 @@ window.selectModel = selectModel;
 window.toggleModelSelector = toggleModelSelector;
 window.startRelocate = startRelocate;
 window.resetScale = resetScale;
+
+// --- End of <script type="module"> content ---
+
+// --- Inline onclicks (external to <script> block, but part of logic) ---
+/*
+<button ... onclick="toggleControlPanel()">
+<button ... onclick="toggleControlPanel()">
+<button ... onclick="toggleModelSelector(true)">
+<button ... onclick="toggleInteractionMode()">
+<button ... onclick="toggleARMode()">
+<button ... onclick="startRelocate()" ...>
+<button ... onclick="resetScale()" ...>
+<button ... onclick="toggleMotionTracking(true)">
+<input ... oninput="updateModelPlacement()" /> (3 times)
+<button ... onclick="adjustScale(-0.1)">
+<button ... onclick="adjustScale(0.1)">
+<button ... onclick="selectModel('Duck')">
+<button ... onclick="selectModel('Helmet')">
+<button ... onclick="selectModel('BoomBox')">
+<button ... onclick="toggleModelSelector(false)">
+*/
